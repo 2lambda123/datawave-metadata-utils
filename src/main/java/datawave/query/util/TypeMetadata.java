@@ -5,11 +5,16 @@ import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.TreeSet;
+import java.util.stream.Collectors;
 
 import com.google.common.base.Splitter;
 import com.google.common.collect.HashMultimap;
@@ -22,11 +27,20 @@ import com.google.common.collect.Sets;
 
 public class TypeMetadata implements Serializable {
     
-    private Set<String> ingestTypes = Sets.newHashSet();
+    private Set<String> ingestTypes = new TreeSet<>();
     
-    private Set<String> fieldNames = Sets.newHashSet();
+    private Set<String> fieldNames = new TreeSet<>();
     
+    private Map<String,Integer> ingestTypesMiniMap = new HashMap<>();
+    private Map<String,Integer> dataTypesMiniMap = new HashMap<>();
+    
+    // <ingestType, <fieldName, DataType(s)>>
     protected Map<String,Multimap<String,String>> typeMetadata;
+    
+    public static final Multimap<String,String> emptyMap = HashMultimap.create();
+    
+    private static final String INGESTTYPE_PREFIX = "dts";
+    private static final String DATATYPES_PREFIX = "types";
     
     public TypeMetadata() {
         typeMetadata = Maps.newHashMap();
@@ -35,6 +49,15 @@ public class TypeMetadata implements Serializable {
     public TypeMetadata(String in) {
         typeMetadata = Maps.newHashMap();
         this.fromString(in);
+    }
+    
+    public TypeMetadata(String in, boolean newFormat) throws Exception {
+        typeMetadata = Maps.newHashMap();
+        if (newFormat) {
+            this.fromNewString(in);
+        } else {
+            this.fromString(in);
+        }
     }
     
     public TypeMetadata(TypeMetadata in) {
@@ -328,6 +351,152 @@ public class TypeMetadata implements Serializable {
         return Iterables.toArray(list, String.class);
     }
     
+    private static Map<String,Integer> parseTypes(String typeEntry) {
+        // dts:[0:ingest1,1:ingest2]
+        // types:[0:DateType,1:IntegerType,2:LcType]
+        
+        // remove type designation and leading/trailing brackets
+        String types = typeEntry.split(":\\[")[1];
+        String typeEntries = types.substring(0, types.length() - 1);
+        
+        Map<String,Integer> typeMap = new HashMap<>();
+        
+        for (String entry : typeEntries.split(",")) {
+            String[] entryParts = entry.split(":");
+            typeMap.put(entryParts[1], Integer.valueOf(entryParts[0]));
+        }
+        
+        return typeMap;
+    }
+    
+    public String toNewString() {
+        StringBuilder sb = new StringBuilder();
+        
+        // create and append ingestTypes mini-map
+        sb.append("dts:[");
+        Iterator<String> ingestIter = ingestTypes.iterator();
+        for (int i = 0; i < ingestTypes.size(); i++) {
+            String ingestType = ingestIter.next();
+            sb.append(i).append(":");
+            sb.append(ingestType);
+            sb.append(ingestIter.hasNext() ? "," : "];");
+            ingestTypesMiniMap.put(ingestType, i);
+        }
+        
+        // create and append dataTypes mini-map
+        sb.append("types:[");
+        Iterator<Multimap<String,String>> typesIter = typeMetadata.values().iterator();
+        Set<String> dataTypes = new TreeSet<>();
+        while (typesIter.hasNext()) {
+            dataTypes.addAll(typesIter.next().values());
+        }
+        
+        Iterator<String> dataIter = dataTypes.iterator();
+        for (int i = 0; i < dataTypes.size(); i++) {
+            String dataType = dataIter.next();
+            sb.append(i).append(":");
+            sb.append(dataType);
+            sb.append(dataIter.hasNext() ? "," : "];");
+            dataTypesMiniMap.put(dataType, i);
+        }
+        
+        // append fieldNames and their associated ingestTypes and Normalizers
+        // ensure ordering for ease of type -> mini-map mapping
+        Set<String> fieldNames = new TreeSet<>();
+        Set<String> ingestTypes = typeMetadata.keySet().stream().sorted().collect(Collectors.toCollection(LinkedHashSet::new));
+        for (String ingestType : ingestTypes) {
+            fieldNames.addAll(typeMetadata.get(ingestType).keySet());
+        }
+        
+        Iterator<String> fieldIter = fieldNames.iterator();
+        while (fieldIter.hasNext()) {
+            String fieldName = fieldIter.next();
+            sb.append(fieldName).append(":[");
+            Iterator<String> iIter = ingestTypes.iterator();
+            while (iIter.hasNext()) {
+                String ingestType = iIter.next();
+                if (!typeMetadata.get(ingestType).containsKey(fieldName)) {
+                    continue;
+                }
+                for (String dataType : typeMetadata.get(ingestType).get(fieldName)) {
+                    sb.append(ingestTypesMiniMap.get(ingestType)).append(':');
+                    sb.append(dataTypesMiniMap.get(dataType));
+                }
+                sb.append(iIter.hasNext() ? "," : "");
+            }
+            sb.append(fieldIter.hasNext() ? "];" : "]");
+        }
+        
+        return sb.toString();
+    }
+    
+    private void fromNewString(String data) throws Exception {
+        fieldNames = Sets.newHashSet();
+        String[] entries = parse(data, ';');
+        
+        if (entries.length > 2) {
+            for (String entry : entries) {
+                if (entry.startsWith(INGESTTYPE_PREFIX)) {
+                    ingestTypesMiniMap = parseTypes(entry);
+                } else if (entry.startsWith(DATATYPES_PREFIX)) {
+                    dataTypesMiniMap = parseTypes(entry);
+                } else {
+                    String[] entrySplits = parse(entry, ':');
+                    
+                    // get rid of the leading and trailing brackets:
+                    entrySplits[1] = entrySplits[1].substring(1, entrySplits[1].length() - 1);
+                    String[] values = parse(entrySplits[1], ',');
+                    
+                    for (String aValue : values) {
+                        // @formatter:off
+                        String[] vs = Iterables
+                                .toArray(Splitter.on(':')
+                                        .omitEmptyStrings()
+                                        .trimResults()
+                                        .split(aValue), String.class);
+
+                        String ingestType = ingestTypesMiniMap
+                                .entrySet()
+                                .stream()
+                                .filter(e -> e.getValue().equals(Integer.valueOf(vs[0])))
+                                .map(Map.Entry::getKey)
+                                .findFirst().get();
+
+                        String dataType = dataTypesMiniMap
+                                .entrySet()
+                                .stream()
+                                .filter(e -> e.getValue().equals(Integer.valueOf(vs[1])))
+                                .map(Map.Entry::getKey)
+                                .findFirst().get();
+                        
+
+                        Multimap<String, String> mm = typeMetadata.get(ingestType);
+                        if (null == mm) {
+                            mm = HashMultimap.create();
+                            typeMetadata.put(ingestType, mm);
+                        }
+
+                        String[] rhs = Iterables
+                                .toArray(Splitter.on(',')
+                                        .omitEmptyStrings()
+                                        .trimResults()
+                                        .split(dataType), String.class);
+                        // @formatter:on
+                        
+                        this.ingestTypes.add(ingestType);
+                        for (String r : rhs) {
+                            mm.put(entrySplits[0], r);
+                        }
+                    }
+                    fieldNames.add(entrySplits[0]);
+                }
+            }
+        } else {
+            throw new Exception("Unable to parse string using mini-map format");
+        }
+        
+    }
+    
     @Override
     public int hashCode() {
         final int prime = 31;
@@ -346,12 +515,9 @@ public class TypeMetadata implements Serializable {
             return false;
         TypeMetadata other = (TypeMetadata) obj;
         if (typeMetadata == null) {
-            if (other.typeMetadata != null)
-                return false;
-        } else if (!toString().equals(obj.toString())) {
-            return false;
-        }
-        return true;
+            return other.typeMetadata == null;
+        } else
+            return toString().equals(obj.toString());
     }
     
     private void writeObject(ObjectOutputStream out) throws Exception {
